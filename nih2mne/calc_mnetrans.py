@@ -36,9 +36,10 @@ def coords_from_tagfile(tag_fname):
         if ('Left Ear' in row) | ('Right Ear' in row):
             keyval_1, keyval_2, xyz = row.split(sep=' ', maxsplit=2)
             keyval=keyval_1+' '+keyval_2
-        keyval = keyval.strip("'") #Remove extra quotes
-        xyz = [float(i) for i in xyz.split(' ')]
-        coord[keyval] = xyz
+        if ('Nasion' in row) or ('Ear' in row):
+            keyval = keyval.strip("'") #Remove extra quotes
+            xyz = [float(i) for i in xyz.split(' ') if len(i) >0]
+            coord[keyval] = xyz
     return coord
 
 def coords_from_bsight_txt(bsight_txt_fname):
