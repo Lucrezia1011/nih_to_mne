@@ -35,8 +35,99 @@ import glob
 import time
 from PyQt5.QtCore import QTimer
 import pandas as pd
+import hashlib
+from pathlib import Path
+import ast
 
 DATPROC_DIR = op.expanduser('~/megcore/datproc')
+
+
+def git_blob_hash(filepath: str) -> str:
+    "Confirm the process file has not changed"
+    data = Path(filepath).read_bytes()
+    header = f"blob {len(data)}\0".encode()
+    return hashlib.sha1(header + data).hexdigest()
+
+
+def _extract_literal_string_assignments(filepath, variable_names):
+    "Helper function to pull information out of logfile"
+    try:
+        tree = ast.parse(Path(filepath).read_text())
+    except (OSError, SyntaxError, UnicodeDecodeError):
+        return {}
+
+    assignments = {}
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assign):
+            continue
+        if len(node.targets) != 1 or not isinstance(node.targets[0], ast.Name):
+            continue
+        target_name = node.targets[0].id
+        if target_name not in variable_names:
+            continue
+        if isinstance(node.value, ast.Constant) and isinstance(node.value.value, str):
+            assignments[target_name] = node.value.value
+    return assignments
+
+
+def extract_processing_log_info(filepath):
+    assignments = _extract_literal_string_assignments(filepath, {'project'})
+    project_name = assignments.get('project')
+    if project_name == None:
+        return None
+
+    try:
+        file_text = Path(filepath).read_text()
+    except (OSError, UnicodeDecodeError):
+        return None
+
+    log_name = None
+    for line in file_text.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith('log_fname'):
+            continue
+        quote_char = '"' if '"' in stripped else "'"
+        if quote_char not in stripped:
+            continue
+        try:
+            candidate = stripped.split(quote_char)[1]
+        except IndexError:
+            continue
+        if candidate.lower().endswith('.log'):
+            log_name = op.basename(candidate)
+            break
+    if log_name == None:
+        return None
+
+    return dict(project=project_name, logfile_name=log_name)
+
+
+def get_subject_processing_logfile(bids_root, subject_name, processing_file):
+    log_info = extract_processing_log_info(processing_file)
+    if log_info == None:
+        return None
+    subject_dirname = subject_name if str(subject_name).startswith('sub-') else f'sub-{subject_name}'
+    return op.join(bids_root, 'derivatives', log_info['project'], 'logging',
+                   subject_dirname, log_info['logfile_name'])
+
+
+def get_subject_processing_status(logfile, processing_hash):
+    if (logfile == None) or (processing_hash == None) or (not op.isfile(logfile)):
+        return ''
+    try:
+        log_text = Path(logfile).read_text()
+    except (OSError, UnicodeDecodeError):
+        return ''
+
+    start_marker = f'START :: {processing_hash}'
+    finish_marker = f'FINISHED :: {processing_hash}'
+    has_start = start_marker in log_text
+    has_finish = finish_marker in log_text
+    if has_start and has_finish:
+        return '(SUCCESS)'
+    if has_start:
+        return '(ERROR)'
+    return ''
 
 
 def get_task_datproc_files(task_name, datproc_dir=DATPROC_DIR):
@@ -86,6 +177,89 @@ def submit_datproc_job(processing_file, dataset_fname, subject_name, task_name,
                       time=time_limit,
                       logdir=op.join(log_root, 'logdir'),
                       logfile_prefix=logfile_prefix)
+
+class SubjectSelectionDialog(QtWidgets.QDialog):
+    def __init__(self, subjects, selected_subjects, subject_statuses=None, parent=None):
+        super().__init__(parent)
+        self.subjects = list(subjects)
+        self.selected_subjects = set(selected_subjects)
+        self.subject_statuses = subject_statuses or {}
+        self.setWindowTitle('Select Subjects')
+        self.resize(420, 480)
+
+        main_layout = QVBoxLayout()
+
+        top_buttons_layout = QHBoxLayout()
+        self.b_select_all = QPushButton('Select All')
+        self.b_select_all.clicked.connect(self.select_all)
+        top_buttons_layout.addWidget(self.b_select_all)
+        self.b_unselect_all = QPushButton('Unselect All')
+        self.b_unselect_all.clicked.connect(self.unselect_all)
+        top_buttons_layout.addWidget(self.b_unselect_all)
+        main_layout.addLayout(top_buttons_layout)
+
+        scroll_area = QtWidgets.QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_widget = QWidget()
+        self.subject_layout = QVBoxLayout()
+        self.subject_layout.setContentsMargins(0, 0, 0, 0)
+
+        self.subject_buttons = {}
+        for subject in self.subjects:
+            row_layout = QHBoxLayout()
+            row_layout.addWidget(QLabel(subject))
+            status_label = QLabel(self.subject_statuses.get(subject, ''))
+            row_layout.addWidget(status_label)
+            row_layout.addStretch()
+
+            button = QPushButton()
+            button.clicked.connect(lambda _, subj=subject: self.toggle_subject(subj))
+            row_layout.addWidget(button)
+            self.subject_layout.addLayout(row_layout)
+            self.subject_buttons[subject] = button
+        self.subject_layout.addStretch()
+        self.refresh_buttons()
+
+        scroll_widget.setLayout(self.subject_layout)
+        scroll_area.setWidget(scroll_widget)
+        main_layout.addWidget(scroll_area)
+
+        bottom_buttons_layout = QHBoxLayout()
+        self.b_apply = QPushButton('Apply')
+        self.b_apply.clicked.connect(self.accept)
+        bottom_buttons_layout.addWidget(self.b_apply)
+        self.b_cancel = QPushButton('Cancel')
+        self.b_cancel.clicked.connect(self.reject)
+        bottom_buttons_layout.addWidget(self.b_cancel)
+        main_layout.addLayout(bottom_buttons_layout)
+
+        self.setLayout(main_layout)
+
+    def select_all(self):
+        self.selected_subjects = set(self.subjects)
+        self.refresh_buttons()
+
+    def unselect_all(self):
+        self.selected_subjects = set()
+        self.refresh_buttons()
+
+    def toggle_subject(self, subject):
+        if subject in self.selected_subjects:
+            self.selected_subjects.remove(subject)
+        else:
+            self.selected_subjects.add(subject)
+        self.refresh_buttons()
+
+    def refresh_buttons(self):
+        for subject, button in self.subject_buttons.items():
+            if subject in self.selected_subjects:
+                button.setText('Exclude')
+            else:
+                button.setText('Include')
+
+    def get_selected_subjects(self):
+        return [subject for subject in self.subjects
+                if subject in self.selected_subjects]
 
 
 class DatprocSubmissionDialog(QtWidgets.QDialog):
@@ -231,6 +405,9 @@ class ProjectDatprocSubmissionDialog(QtWidgets.QDialog):
         super().__init__(project_window)
         self.project_window = project_window
         self.bids_project = project_window.bids_project
+        self.matched_subjects = []
+        self.selected_subjects = set()
+        self.selected_processing_hash = None
         self.setWindowTitle('Submit Project Datproc Jobs')
 
         main_layout = QVBoxLayout()
@@ -255,15 +432,20 @@ class ProjectDatprocSubmissionDialog(QtWidgets.QDialog):
         procfile_layout = QHBoxLayout()
         procfile_layout.addWidget(QLabel('Processing File'))
         self.b_processing_file = QComboBox()
-        self.b_processing_file.currentIndexChanged.connect(self.update_summary)
+        self.b_processing_file.currentIndexChanged.connect(self.on_processing_file_changed)
         procfile_layout.addWidget(self.b_processing_file)
         main_layout.addLayout(procfile_layout)
 
+        dataset_layout = QHBoxLayout()
         self.l_dataset_count = QLabel()
+        dataset_layout.addWidget(self.l_dataset_count)
+        self.b_select_subjects = QPushButton('Select Subjects')
+        self.b_select_subjects.clicked.connect(self.open_subject_selector)
+        dataset_layout.addWidget(self.b_select_subjects)
+        main_layout.addLayout(dataset_layout)
         self.l_match_status = QLabel()
         self.l_cmd_preview = QLabel()
         self.l_cmd_preview.setWordWrap(True)
-        main_layout.addWidget(self.l_dataset_count)
         main_layout.addWidget(self.l_match_status)
 
         resources_layout = QHBoxLayout()
@@ -282,7 +464,7 @@ class ProjectDatprocSubmissionDialog(QtWidgets.QDialog):
         main_layout.addWidget(self.l_cmd_preview)
 
         button_layout = QHBoxLayout()
-        self.b_submit = QPushButton('Submit All')
+        self.b_submit = QPushButton('Submit Selected')
         self.b_submit.clicked.connect(self.submit_jobs)
         button_layout.addWidget(self.b_submit)
         self.b_close = QPushButton('Close')
@@ -306,29 +488,147 @@ class ProjectDatprocSubmissionDialog(QtWidgets.QDialog):
     def get_selected_task_datasets(self):
         return collect_task_datasets(self.bids_project, self.get_selected_task())
 
+    def get_matching_subjects(self, datasets):
+        return sorted({subject for subject, _, _ in datasets})
+
+    def sync_subject_selection(self, matched_subjects):
+        matched_subjects = list(matched_subjects)
+        if set(matched_subjects) != set(self.matched_subjects):
+            self.selected_subjects = set(matched_subjects)
+        else:
+            self.selected_subjects = {subject for subject in self.selected_subjects
+                                      if subject in matched_subjects}
+        self.matched_subjects = matched_subjects
+
+    def get_selected_datasets(self):
+        datasets = self.get_selected_task_datasets()
+        return [item for item in datasets if item[0] in self.selected_subjects]
+
+    def on_processing_file_changed(self):
+        self.selected_processing_hash = None
+        self.update_summary()
+
+    def capture_processing_file_hash(self):
+        processing_path = self.get_selected_processing_path()
+        if processing_path == None:
+            self.selected_processing_hash = None
+            return None
+        if not op.isfile(processing_path):
+            self.selected_processing_hash = None
+            QMessageBox.warning(self, 'Processing File Not Found',
+                                f'Processing file does not exist:\n{processing_path}')
+            return None
+        try:
+            self.selected_processing_hash = git_blob_hash(processing_path)
+        except OSError as exc:
+            self.selected_processing_hash = None
+            QMessageBox.warning(self, 'Processing File Error',
+                                f'Could not read processing file:\n{processing_path}\n\n{exc}')
+            return None
+        return self.selected_processing_hash
+
+    def confirm_processing_file_unchanged(self):
+        if self.selected_processing_hash == None:
+            return True
+        processing_path = self.get_selected_processing_path()
+        if processing_path == None or (not op.isfile(processing_path)):
+            QMessageBox.warning(self, 'Processing File Changed',
+                                'The selected processing file is no longer available. '
+                                'Re-open Select Subjects to refresh it.')
+            return False
+        try:
+            current_hash = git_blob_hash(processing_path)
+        except OSError as exc:
+            QMessageBox.warning(self, 'Processing File Error',
+                                f'Could not read processing file:\n{processing_path}\n\n{exc}')
+            return False
+        if current_hash != self.selected_processing_hash:
+            QMessageBox.warning(self, 'Processing File Changed',
+                                'The selected processing file changed after subjects were chosen. '
+                                'Re-open Select Subjects to confirm the new file contents.')
+            return False
+        return True
+
+    def get_subject_processing_statuses(self):
+        processing_path = self.get_selected_processing_path()
+        processing_hash = self.selected_processing_hash
+        if (processing_path == None) or (processing_hash == None):
+            return {}
+
+        subject_statuses = {}
+        bids_root = getattr(self.bids_project, 'bids_root', None)
+        if bids_root == None:
+            return subject_statuses
+
+        for subject in self.matched_subjects:
+            logfile = get_subject_processing_logfile(bids_root, subject, processing_path)
+            subject_statuses[subject] = get_subject_processing_status(logfile, processing_hash)
+        return subject_statuses
+
+    def get_subject_selector_initial_selection(self, subject_statuses):
+        initial_selection = set(self.selected_subjects)
+        if initial_selection != set(self.matched_subjects):
+            return initial_selection
+        return {
+            subject for subject in initial_selection
+            if subject_statuses.get(subject, '') not in {'(ERROR)', '(SUCCESS)'}
+        }
+
+    def open_subject_selector(self):
+        if len(self.matched_subjects) == 0:
+            QMessageBox.information(self, 'No Matching Subjects',
+                                    'No matching subjects are available for selection.')
+            return
+        if self.capture_processing_file_hash() == None:
+            return
+
+        subject_statuses = self.get_subject_processing_statuses()
+        initial_selection = self.get_subject_selector_initial_selection(subject_statuses)
+        dialog = SubjectSelectionDialog(self.matched_subjects,
+                                        initial_selection,
+                                        subject_statuses=subject_statuses,
+                                        parent=self)
+        if dialog.exec_() == QtWidgets.QDialog.Accepted:
+            self.selected_subjects = set(dialog.get_selected_subjects())
+            self.update_summary()
+
     def refresh_matches(self):
         task_name = self.get_selected_task()
         datproc_dir = self.b_datproc_dir.text().strip()
+        datasets = self.get_selected_task_datasets()
+        self.sync_subject_selection(self.get_matching_subjects(datasets))
+        self.selected_processing_hash = None
         self.b_processing_file.clear()
         task_files = get_task_datproc_files(task_name, datproc_dir=datproc_dir)
         if len(task_files) > 0:
             self.b_processing_file.addItems(task_files)
             self.l_match_status.setText(f'Found {len(task_files)} matching processing files')
-            self.b_submit.setEnabled(True)
         else:
             self.l_match_status.setText(f'No processing files found in {datproc_dir}')
-            self.b_submit.setEnabled(False)
         self.update_summary()
 
     def update_summary(self):
         datasets = self.get_selected_task_datasets()
-        self.l_dataset_count.setText(f'Matching datasets in project: {len(datasets)}')
+        selected_datasets = self.get_selected_datasets()
+        self.l_dataset_count.setText(
+            f'Matching datasets in project: {len(datasets)} '
+            f'(subjects selected: {len(self.selected_subjects)}/{len(self.matched_subjects)})'
+        )
+        self.b_select_subjects.setEnabled(len(self.matched_subjects) > 0)
+        self.b_submit.setEnabled((self.get_selected_processing_path() != None) and
+                                 (len(selected_datasets) > 0))
         processing_path = self.get_selected_processing_path()
-        if (processing_path == None) or (len(datasets) == 0):
+        if processing_path == None:
             self.l_cmd_preview.setText('No task-matched processing file selected')
             return
+        if len(datasets) == 0:
+            self.l_cmd_preview.setText('No project datasets match the selected task')
+            return
+        if len(selected_datasets) == 0:
+            self.l_cmd_preview.setText('No subjects are selected for batch processing')
+            return
 
-        _, _, dset = datasets[0]
+        _, _, dset = selected_datasets[0]
         self.l_cmd_preview.setText(build_datproc_command(processing_path, dset.rel_path))
 
     def submit_jobs(self):
@@ -343,11 +643,13 @@ class ProjectDatprocSubmissionDialog(QtWidgets.QDialog):
             QMessageBox.warning(self, 'No Processing File',
                                 'No task-matched processing file is selected')
             return
+        if not self.confirm_processing_file_unchanged():
+            return
 
-        datasets = self.get_selected_task_datasets()
+        datasets = self.get_selected_datasets()
         if len(datasets) == 0:
-            QMessageBox.warning(self, 'No Matching Datasets',
-                                f'No project datasets were found for task {self.get_selected_task()}')
+            QMessageBox.warning(self, 'No Selected Datasets',
+                                f'No selected project datasets were found for task {self.get_selected_task()}')
             return
 
         try:
@@ -386,7 +688,6 @@ class ProjectDatprocSubmissionDialog(QtWidgets.QDialog):
         else:
             QMessageBox.warning(self, 'Submission Failed',
                                 'No slurm jobs were submitted. Check terminal output for details.')
-
 
 ## Create subject tile
 class Subject_Tile(QWidget):
@@ -960,7 +1261,7 @@ def cmdline_main():
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument('-bids_root', help='Path to your BIDS folder', 
-                        required=True)
+                        default=os.getcwd())
     parser.add_argument('-num_rows', help='Number of subject rows',
                         default=6, type=int)
     parser.add_argument('-num_cols', help='Number of subject columns',

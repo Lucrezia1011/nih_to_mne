@@ -28,9 +28,35 @@ from mne_bids import BIDSPath
 import pathlib
 import copy
 from mne.preprocessing import annotate_muscle_zscore
+from autoreject import AutoReject
+import hashlib
+import subprocess
+
+def git_blob_hash(filepath: str) -> str:
+    "Confirm the process file has not changed"
+    data = pathlib.Path(filepath).read_bytes()
+    header = f"blob {len(data)}\0".encode()
+    return hashlib.sha1(header + data).hexdigest()
+
+
+
+
+
+
 
 if "SLURM_JOB_ID" in os.environ:
     n_jobs = int(os.environ.get("SLURM_CPUS_PER_TASK", "1"))
+    job_id = os.environ.get("SLURM_JOB_ID")
+    result = subprocess.run(
+        ["scontrol", "show", "job", job_id],
+        capture_output=True, text=True
+    )
+
+    # Parse StdOut from the output
+    for token in result.stdout.split():
+        if token.startswith("StdOut="):
+            slurm_logfile_path = token.split("=", 1)[1]
+            break
 else:
     n_jobs = -1
 
@@ -54,10 +80,13 @@ anat_bids_path = BIDSPath(root=bids_root, subject=subject, datatype='anat',
 deriv_path = bids_path.copy().update(root= bids_path.root / 'derivatives',
                                      check=False)
 preprocessing_path = deriv_path.copy().update(root = deriv_path.root / 'preproc')
-preprocessing_path.root.mkdir(exist_ok=True)
+#Create temp structure to force the fpath creation (requires suffix+extension) to gen parent
+_ = preprocessing_path.copy().update(suffix='meg',extension='.ds').fpath.parent.mkdir(parents=True, exist_ok=True)
 
 output_path = deriv_path.copy().update(root = deriv_path.root / project)
-output_path.root.mkdir(exist_ok=True)
+#Create temp structure to force the fpath creation (requires suffix+extension) to gen parent
+_ = output_path.copy().update(suffix='meg',extension='.ds').fpath.parent.mkdir(parents=True, exist_ok=True)
+
 log_dir = output_path.root / 'logging' / f'sub-{bids_path.subject}'
 log_dir.mkdir(parents=True, exist_ok=True)
 log_fname = log_dir / 'beamformer_template.log'
@@ -71,6 +100,11 @@ _log_handler.setFormatter(
 )
 logger.addHandler(_log_handler)
 logger.propagate = False
+
+_procfile_hash = git_blob_hash(os.path.abspath(__file__))
+logger.info(f'START :: {_procfile_hash}')
+if "SLURM_JOB_ID" in os.environ:
+    logger.info(f'SLURM_LOGFILE_PATH :: {slurm_logfile_path}')
 
 subjects_dir = deriv_path.root / 'freesurfer' / 'subjects'
 fs_subject = 'sub-'+bids_path.subject
@@ -105,7 +139,10 @@ def get_make_bem_solution(bem_fname, fs_subject, subjects_dir, logger):
             bem_sol = mne.read_bem_solution(bem_fname)
         else:
             logger.info(f'Creating BEM solution: {bem_fname.fpath}')
-            mne.bem.make_watershed_bem(fs_subject, subjects_dir=subjects_dir, overwrite=True)
+            br_surf = op.join(subjects_dir, fs_subject, 'bem', 'brain.surf')
+            in_surf = op.join(subjects_dir, fs_subject, 'bem', 'inner_skull.surf')
+            if not op.exists(br_surf) and not op.exists(in_surf):
+                mne.bem.make_watershed_bem(fs_subject, subjects_dir=subjects_dir, overwrite=True)
             bem = mne.make_bem_model(fs_subject, subjects_dir=subjects_dir,
                                      conductivity=[0.3])
             bem_sol = mne.make_bem_solution(bem)
@@ -194,6 +231,7 @@ noise_raw.notch_filter([60,120,180], n_jobs=n_jobs)
 
 # create epochs
 evts, evtsid = mne.events_from_annotations(raw)
+evtsid = {i:j for i,j in evtsid.items() if i in conds_OI} 
 epo = mne.Epochs(raw, 
                  preload=True, 
                  tmin=epo_tmin, 
@@ -202,6 +240,26 @@ epo = mne.Epochs(raw,
                  events=evts,
                  event_id = evtsid, 
                  reject = reject_dict)
+
+#%% Auto reject
+epo.load_data()
+epo.pick_types(meg=True, ref_meg=False)
+logging.info('Starting Autoreject')
+ar = AutoReject(n_interpolate=[1, 4, 8], 
+                picks='meg', 
+                random_state=0,
+                n_jobs=n_jobs, 
+                consensus=[0.8, 0.9, 1.0], 
+                cv=5,
+                )
+cleaned_epo, reject_log = ar.fit_transform(epo, return_log=True)
+
+cleaned_epo_bidspath = output_path.copy().update(extension='.fif', 
+                                             run=run, session=ses, description='arCleanedEpo')
+cleaned_epo.save(str(cleaned_epo_bidspath.fpath))
+logging.info(f'Saving Autoreject cleaned epochs to {str(cleaned_epo_bidspath.fpath)}')
+epo = cleaned_epo
+
 
 
 #%% Perform the beamformer actions
@@ -215,6 +273,7 @@ def normalize_beamfilt_ori(fwd, filters):
 # compute ICA 
 
 # Create cov
+## Data Covariance
 full_cov = mne.compute_covariance(epo[conds_OI], 
                                   cv=cov_cv, 
                                   method=cov_method)
@@ -224,15 +283,35 @@ full_cov_bidspath = output_path.copy().update(suffix='cov',
                                               )
 full_cov_bidspath.fpath.parent.mkdir(parents=True, exist_ok=True)
 full_cov.save(full_cov_bidspath.fpath, overwrite=overwrite_beam)
+full_cov_cond = np.linalg.cond(full_cov.data)
+logger.info(f'Data covariance condition number: {full_cov_cond}')
 logger.info(f'Saved full covariance to: {full_cov_bidspath.fpath}')
+if 10e5 < full_cov_cond < 10e7:
+    logger.warn(f'Data covariance has moderate condition #')
+elif 10e7 < full_cov_cond:
+    logger.error('Data covariance is ill-conditioned')
+    raise ValueError('Data covariance is ill-conditioned')
+    
+if np.linalg.matrix_rank(full_cov.data) > len(full_cov.ch_names):
+    logger.error('Data covariance is not full-rank')
+    raise ValueError('Data is not full-rank, add regularization')
 
+## Noise Covariance
 noise_cov = mne.compute_raw_covariance(noise_raw)
 noise_cov_bidspath = output_path.copy().update(suffix='cov', 
                                               extension='.fif',
                                               description=f'NOISEf{f_min}f{f_max}'
                                               )
 noise_cov.save(noise_cov_bidspath.fpath, overwrite=overwrite_beam)
+noise_cov_cond = np.linalg.cond(noise_cov.data)
+logger.info(f'Noise covariance condition number: {noise_cov_cond}')
 logger.info(f'Saved noise covariance to: {noise_cov_bidspath.fpath}')
+if 10e5 < noise_cov_cond < 10e7:
+    logger.warn(f'Noise covariance has moderate condition #')
+elif 10e7 < noise_cov_cond:
+    logger.error('Noise covariance is ill-conditioned')
+    raise ValueError('Noise covariance is ill-conditioned')
+
 
 # Make wts
 filters = make_lcmv(epo.info, fwd, full_cov, noise_cov= noise_cov,
@@ -243,8 +322,6 @@ filters_bidspath = output_path.copy().update(description=f'LCMVf{f_min}f{f_max}'
                                              suffix='lcmv')
 filters.save(filters_bidspath.fpath, overwrite=overwrite_beam)
 logger.info(f'Saved LCMV filters to: {filters_bidspath.fpath}')
-# make_bids_json(filters_bidspath
-
 
 stc_basename = output_path.copy().update(extension='.stc')
                                          
@@ -258,15 +335,32 @@ def stc_proc(epo, taskname, filters, return_abs=False, save_ave=True,
     if save_epo:
         pass  #set this up to iterate through epochs and save
     
-    
     if save_ave:
         stc_bidspath = stc_basename.copy().update(description=f'{taskname}',
                                                   processing=f'f{f_min}f{f_max}')
         _ave_stcs.save(stc_bidspath)
         logger.info(f'Saved average STC to: {stc_bidspath.fpath}')
+        
+        # Morph to fs_average
+        stc_fs = mne.compute_source_morph(stc, subject_from=subject,
+                                          subject_to='fsaverage',
+                                          subjects_dir=subjects_dir,
+                                          smooth=5,
+                                          verbose="error").apply(_ave_stcs)
+        
+        fsaverage_ss = f"{subjects_dir}/fsaverage/bem/fsaverage-ico-5-src.fif"
+        bem_ss = f"{subjects_dir}/fsaverage/bem/fsaverage-5120-5120-5120-bem-sol.fif"
+        fs_src = mne.read_source_spaces(fsaverage_ss)
+        fs_bem = mne.read_bem_solution(bem_ss)
+        
+        gifti_outname = stc_bidspath.copy(description=f'{taskname}FSAVERAGE')
+        stc_fs.save_as_surface(gifti_outname, src=fs_src)
+        
     return _tmp_stcs, _ave_stcs
 
 
 for cond in conds_OI:
     _ = stc_proc(epo, cond, filters, save_ave=True, save_epo=True)
     
+logger.info(f'FINISHED :: {_procfile_hash}')
+
